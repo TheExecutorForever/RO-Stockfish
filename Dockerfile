@@ -12,5 +12,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY main.py .
 
 ENV STOCKFISH_PATH=/usr/games/stockfish
+ENV ANALYSIS_TIME=0.5
 
 CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-10000}
