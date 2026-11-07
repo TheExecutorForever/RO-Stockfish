@@ -1,63 +1,24 @@
 
 import os
-import random
-import shutil
 import threading
+from typing import Optional
 
 import chess
 import chess.engine
-
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
-from typing import Optional
 
+app = FastAPI(title="RO-Stockfish API", version="2.0.0")
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
-app = FastAPI(
-    title="RO-Stockfish",
-    description="Chess analysis API powered by Stockfish",
-    version="2.0.0"
-)
-
-STOCKFISH_PATH = os.getenv(
-    "STOCKFISH_PATH",
-    shutil.which("stockfish") or "/usr/games/stockfish"
-)
-
-ANALYSIS_TIME = 0.25
-MAX_CANDIDATES = 8
+STOCKFISH_PATH = os.getenv("STOCKFISH_PATH", "/usr/games/stockfish")
 
 engine = None
 engine_lock = threading.Lock()
 
 
-# ============================================================
-# PIECE DATA
-# ============================================================
-
-PIECE_TYPES = {
-    "Pawn": chess.PAWN,
-    "Knight": chess.KNIGHT,
-    "Bishop": chess.BISHOP,
-    "Rook": chess.ROOK,
-    "Queen": chess.QUEEN,
-    "King": chess.KING,
-}
-
-PROMOTION_TYPES = {
-    "Queen": chess.QUEEN,
-    "Rook": chess.ROOK,
-    "Bishop": chess.BISHOP,
-    "Knight": chess.KNIGHT,
-}
-
-
-# ============================================================
-# REQUEST MODELS
-# ============================================================
+# -------------------------
+# MODELS
+# -------------------------
 
 class SquareData(BaseModel):
     Piece: str
@@ -73,9 +34,7 @@ class AnalyzeRequest(BaseModel):
     piece: str
     color: str
 
-    elo: int = Field(ge=250, le=3000)
-
-    promotion: Optional[str] = None
+    elo: int = Field(default=1200, ge=250, le=3000)
 
     castling: str = "-"
     en_passant: Optional[str] = None
@@ -83,20 +42,17 @@ class AnalyzeRequest(BaseModel):
     halfmove: int = 0
     fullmove: int = 1
 
+    promotion: Optional[str] = None
 
-# ============================================================
-# STOCKFISH
-# ============================================================
+
+# -------------------------
+# ENGINE
+# -------------------------
 
 def get_engine():
     global engine
 
     if engine is None:
-        if not os.path.isfile(STOCKFISH_PATH):
-            raise RuntimeError(
-                f"Stockfish executable not found: {STOCKFISH_PATH}"
-            )
-
         engine = chess.engine.SimpleEngine.popen_uci(
             STOCKFISH_PATH
         )
@@ -109,218 +65,224 @@ def get_engine():
     return engine
 
 
-# ============================================================
-# BOARD CONSTRUCTION
-# ============================================================
+# -------------------------
+# BOARD CREATION
+# -------------------------
+
+PIECE_NAMES = {
+    "Pawn": chess.PAWN,
+    "Knight": chess.KNIGHT,
+    "Bishop": chess.BISHOP,
+    "Rook": chess.ROOK,
+    "Queen": chess.QUEEN,
+    "King": chess.KING
+}
+
 
 def create_board(data: AnalyzeRequest):
 
     board = chess.Board.empty()
 
-    for square_name, info in data.board.items():
+    for square_name, square_data in data.board.items():
 
-        square_name = square_name.lower()
+        square_name = square_name.upper()
 
         if square_name not in chess.SQUARE_NAMES:
+            raise ValueError(f"Invalid square: {square_name}")
+
+        if square_data.Piece not in PIECE_NAMES:
             raise ValueError(
-                f"Invalid square: {square_name}"
+                f"Invalid piece: {square_data.Piece}"
             )
 
-        if info.Piece not in PIECE_TYPES:
+        if square_data.Color not in ["White", "Black"]:
             raise ValueError(
-                f"Invalid piece: {info.Piece}"
+                f"Invalid color: {square_data.Color}"
             )
 
-        if info.Color not in ("White", "Black"):
-            raise ValueError(
-                f"Invalid color: {info.Color}"
-            )
+        piece_type = PIECE_NAMES[square_data.Piece]
+        color = square_data.Color == "White"
 
-        piece = chess.Piece(
-            PIECE_TYPES[info.Piece],
-            info.Color == "White"
+        square = chess.parse_square(
+            square_name.lower()
         )
 
-        square = chess.parse_square(square_name)
+        board.set_piece_at(
+            square,
+            chess.Piece(piece_type, color)
+        )
 
-        board.set_piece_at(square, piece)
-
-    # The submitted player's color is the side to move.
     board.turn = data.color == "White"
 
-    # Castling rights.
-    try:
-        board.set_castling_fen(data.castling)
-    except ValueError:
-        raise ValueError("Invalid castling rights.")
+    board.set_castling_fen(data.castling)
 
-    # En passant.
     if data.en_passant:
-
-        ep = data.en_passant.lower()
-
-        if ep not in chess.SQUARE_NAMES:
-            raise ValueError("Invalid en passant square.")
-
-        board.ep_square = chess.parse_square(ep)
+        board.ep_square = chess.parse_square(
+            data.en_passant.lower()
+        )
 
     board.halfmove_clock = data.halfmove
     board.fullmove_number = data.fullmove
 
     if not board.is_valid():
-        raise ValueError(
-            f"Invalid chess position. Status: {board.status()}"
-        )
+        raise ValueError("Invalid chess position")
 
     return board
 
 
-# ============================================================
-# MOVE CONSTRUCTION
-# ============================================================
+# -------------------------
+# MOVE CREATION
+# -------------------------
 
 def create_move(data: AnalyzeRequest, board):
 
-    old = data.old.lower()
-    new = data.new.lower()
+    old_square = data.old.lower()
+    new_square = data.new.lower()
 
-    if old not in chess.SQUARE_NAMES:
-        raise ValueError("Invalid starting square.")
+    if old_square not in chess.SQUARE_NAMES:
+        raise ValueError("Invalid old square")
 
-    if new not in chess.SQUARE_NAMES:
-        raise ValueError("Invalid destination square.")
+    if new_square not in chess.SQUARE_NAMES:
+        raise ValueError("Invalid new square")
 
-    if data.piece not in PIECE_TYPES:
-        raise ValueError("Invalid submitted piece.")
+    from_square = chess.parse_square(old_square)
+    to_square = chess.parse_square(new_square)
 
-    if data.color not in ("White", "Black"):
-        raise ValueError("Invalid submitted color.")
+    moving_piece = board.piece_at(from_square)
 
-    from_square = chess.parse_square(old)
-    to_square = chess.parse_square(new)
+    if moving_piece is None:
+        raise ValueError("No piece on old square")
 
-    actual_piece = board.piece_at(from_square)
+    expected_piece = PIECE_NAMES.get(data.piece)
 
-    if actual_piece is None:
-        raise ValueError("There is no piece on the starting square.")
+    if expected_piece is None:
+        raise ValueError("Invalid moving piece")
 
-    if actual_piece.piece_type != PIECE_TYPES[data.piece]:
-        raise ValueError("Submitted piece does not match the board.")
+    if moving_piece.piece_type != expected_piece:
+        raise ValueError("Piece does not match board")
 
-    if actual_piece.color != (data.color == "White"):
-        raise ValueError("Submitted color does not match the board.")
+    expected_color = data.color == "White"
+
+    if moving_piece.color != expected_color:
+        raise ValueError("Piece color does not match")
 
     promotion = None
 
     if data.promotion:
+        promotion = PIECE_NAMES.get(data.promotion)
 
-        if data.promotion not in PROMOTION_TYPES:
-            raise ValueError("Invalid promotion piece.")
+        if promotion not in [
+            chess.QUEEN,
+            chess.ROOK,
+            chess.BISHOP,
+            chess.KNIGHT
+        ]:
+            raise ValueError("Invalid promotion")
 
-        promotion = PROMOTION_TYPES[data.promotion]
-
-    move = chess.Move(
+    return chess.Move(
         from_square,
         to_square,
         promotion=promotion
     )
 
-    return move
 
-
-# ============================================================
+# -------------------------
 # MOVE CLASSIFICATION
-# ============================================================
+# -------------------------
 
-def classify_move(centipawn_loss, is_best):
+def classify_move(loss, is_best):
 
     if is_best:
         return "Best"
 
-    if centipawn_loss <= 30:
+    if loss <= 30:
         return "Excellent"
 
-    if centipawn_loss <= 70:
+    if loss <= 70:
         return "Good"
 
-    if centipawn_loss <= 130:
+    if loss <= 130:
         return "Inaccuracy"
 
-    if centipawn_loss <= 250:
+    if loss <= 250:
         return "Mistake"
 
     return "Blunder"
 
 
-# ============================================================
-# ELO-INFLUENCED RECOMMENDATION
-# ============================================================
-
-def choose_recommendation(candidates, elo):
-
-    if not candidates:
-        return None
-
-    # Higher Elo = stronger preference for the top engine moves.
-    temperature = 0.25 + (3000 - elo) / 1000
-
-    weights = []
-
-    for rank, candidate in enumerate(candidates):
-
-        weight = pow(
-            2.718281828,
-            -rank / temperature
-        )
-
-        weights.append(weight)
-
-    selected = random.choices(
-        candidates,
-        weights=weights,
-        k=1
-    )[0]
-
-    return selected
-
-
-# ============================================================
-# MOVE INFORMATION
-# ============================================================
+# -------------------------
+# RECOMMENDATION
+# -------------------------
 
 def move_information(move, board):
 
     piece = board.piece_at(move.from_square)
 
-    if piece is None:
-        return None
-
-    piece_name = chess.piece_name(
-        piece.piece_type
-    ).capitalize()
-
-    color_name = (
-        "White" if piece.color else "Black"
-    )
-
-    result = {
+    return {
         "from": chess.square_name(move.from_square).upper(),
         "to": chess.square_name(move.to_square).upper(),
-        "piece": piece_name,
-        "color": color_name
+        "piece": chess.piece_name(
+            piece.piece_type
+        ).capitalize(),
+        "color": "White" if piece.color else "Black"
     }
 
-    if move.promotion:
-        result["promotion"] = chess.piece_name(
-            move.promotion
-        ).capitalize()
 
-    return result
+def choose_recommendation(engine, board, elo):
+
+    temperature = max(
+        0.05,
+        min(1.5, (2000 - elo) / 1200)
+    )
+
+    results = engine.analyse(
+        board,
+        chess.engine.Limit(time=0.25),
+        multipv=8
+    )
+
+    candidates = []
+
+    for result in results:
+
+        move = result["pv"][0]
+        score = result["score"].pov(board.turn)
+
+        if score.is_mate():
+            value = 10000 if score.mate() > 0 else -10000
+        else:
+            value = score.score()
+
+        candidates.append((move, value))
+
+    if not candidates:
+        return None
+
+    best_score = max(score for _, score in candidates)
+
+    weights = []
+
+    for move, score in candidates:
+        difference = best_score - score
+        weight = 2.71828 ** (
+            -difference / (100 * temperature)
+        )
+        weights.append(weight)
+
+    import random
+
+    selected = random.choices(
+        candidates,
+        weights=weights,
+        k=1
+    )[0][0]
+
+    return selected
 
 
-# ============================================================
+# -------------------------
 # ANALYSIS
-# ============================================================
+# -------------------------
 
 def analyze_position(data: AnalyzeRequest):
 
@@ -328,12 +290,9 @@ def analyze_position(data: AnalyzeRequest):
 
     move = create_move(data, board)
 
-    # Check whether the submitted move is legal.
-    if not board.is_legal(move):
-
+    if move not in board.legal_moves:
         return {
             "legal": False,
-            "reason": "Illegal chess move.",
             "classification": None,
             "centipawn_loss": None,
             "best_move": None,
@@ -344,133 +303,96 @@ def analyze_position(data: AnalyzeRequest):
 
         stockfish = get_engine()
 
-        # Analyze the current position at full engine strength.
-        legal_count = board.legal_moves.count()
-
-        multipv = min(MAX_CANDIDATES, legal_count)
-
-        infos = stockfish.analyse(
+        # Best move before the player's move
+        before = stockfish.analyse(
             board,
-            chess.engine.Limit(time=ANALYSIS_TIME),
-            multipv=multipv
+            chess.engine.Limit(time=0.5)
         )
 
-        if isinstance(infos, dict):
-            infos = [infos]
+        best_move = before["pv"][0]
 
-        candidates = []
+        best_score = before["score"].pov(board.turn)
 
-        for info in infos:
+        # Evaluate the played move
+        board_after = board.copy()
+        board_after.push(move)
 
-            if not info.get("pv"):
-                continue
+        after = stockfish.analyse(
+            board_after,
+            chess.engine.Limit(time=0.5)
+        )
 
-            candidate_move = info["pv"][0]
+        played_score = -after["score"].pov(board.turn)
 
-            candidates.append(candidate_move)
-
-        if not candidates:
-            raise RuntimeError(
-                "Stockfish did not return any candidate moves."
+        if best_score.is_mate() or played_score.is_mate():
+            if best_score == played_score:
+                loss = 0
+            elif best_score.is_mate() and played_score.is_mate():
+                loss = 10000
+            else:
+                loss = 10000
+        else:
+            loss = max(
+                0,
+                best_score.score() - played_score.score()
             )
 
-        # The strongest engine move.
-        best_move = candidates[0]
+        is_best = move == best_move
 
-        # Evaluate the best position from the moving player's POV.
-        best_score = infos[0]["score"].pov(
-            board.turn
-        ).score(mate_score=100000)
-
-        # Evaluate the position after the submitted move.
-        mover = board.turn
-
-        after_board = board.copy()
-        after_board.push(move)
-
-        after_info = stockfish.analyse(
-            after_board,
-            chess.engine.Limit(time=ANALYSIS_TIME)
-        )
-
-        played_score = after_info["score"].pov(
-            mover
-        ).score(mate_score=100000)
-
-        centipawn_loss = max(
-            0,
-            best_score - played_score
-        )
-
-        # Classification is based on full-strength analysis.
         classification = classify_move(
-            centipawn_loss,
-            move == best_move
+            loss,
+            is_best
         )
 
-        # Recommendation is influenced by the requested Elo.
-        recommended_move = choose_recommendation(
-            candidates,
+        recommendation_move = choose_recommendation(
+            stockfish,
+            board,
             data.elo
         )
 
-        return {
-            "legal": True,
-
-            "classification": classification,
-
-            "centipawn_loss": centipawn_loss,
-
-            "best_move": move_information(
-                best_move,
-                board
-            ),
-
-            "recommendation": move_information(
-                recommended_move,
-                board
-            )
-        }
+    return {
+        "legal": True,
+        "classification": classification,
+        "centipawn_loss": loss,
+        "best_move": move_information(best_move, board),
+        "recommendation": move_information(
+            recommendation_move,
+            board
+        ) if recommendation_move else None
+    }
 
 
-# ============================================================
+# -------------------------
 # ROUTES
-# ============================================================
+# -------------------------
 
 @app.get("/")
 def home():
-
     return {
         "status": "online",
-        "name": "RO-Stockfish",
+        "name": "RO-Stockfish API",
         "version": "2.0.0"
     }
 
 
 @app.get("/health")
 def health():
-
-    return {
-        "status": "online"
-    }
+    return {"status": "healthy"}
 
 
 @app.post("/analyze")
 def analyze(data: AnalyzeRequest):
 
     try:
-
         return analyze_position(data)
 
     except ValueError as error:
-
         raise HTTPException(
             status_code=422,
             detail=str(error)
         )
 
     except Exception as error:
-
         raise HTTPException(
             status_code=500,
             detail=str(error)
