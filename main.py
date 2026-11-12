@@ -1,4 +1,3 @@
-
 import os
 import re
 import threading
@@ -18,9 +17,16 @@ ANALYSIS_TIME = max(0.05, float(os.getenv("ANALYSIS_TIME", "0.20")))
 _engine = None
 _engine_lock = threading.Lock()
 
-# Exact image filenames, without extensions.
-# These are the allowed MoveRating values.
-RATING_TYPES = (
+PIECE_NAMES = {
+    "Pawn": chess.PAWN,
+    "Knight": chess.KNIGHT,
+    "Bishop": chess.BISHOP,
+    "Rook": chess.ROOK,
+    "Queen": chess.QUEEN,
+    "King": chess.KING,
+}
+
+RATING_NAMES = {
     "best",
     "blunder",
     "book",
@@ -42,7 +48,7 @@ RATING_TYPES = (
     "resign_black",
     "resign_white",
     "winner",
-)
+}
 
 
 def get_engine():
@@ -54,7 +60,7 @@ def get_engine():
         try:
             _engine.configure({
                 "Threads": ENGINE_THREADS,
-                "Hash": ENGINE_HASH_MB
+                "Hash": ENGINE_HASH_MB,
             })
         except chess.engine.EngineError:
             pass
@@ -64,6 +70,15 @@ def get_engine():
 
 def error(message: str, status: int = 400):
     return jsonify({"Error": message}), status
+
+
+def illegal(message: str):
+    return jsonify({
+        "Legal": False,
+        "Type": "Illegal",
+        "MoveRating": "incorrect",
+        "Reason": message,
+    })
 
 
 def parse_old_moves(old_moves: Any):
@@ -101,21 +116,12 @@ def square_name(value: Any, field: str):
 
 
 def piece_type(value: Any):
-    names = {
-        "Pawn": chess.PAWN,
-        "Knight": chess.KNIGHT,
-        "Bishop": chess.BISHOP,
-        "Rook": chess.ROOK,
-        "Queen": chess.QUEEN,
-        "King": chess.KING,
-    }
-
-    if value not in names:
+    if value not in PIECE_NAMES:
         raise ValueError(
             "Piece must be Pawn, Knight, Bishop, Rook, Queen, or King."
         )
 
-    return names[value]
+    return PIECE_NAMES[value]
 
 
 def verify_position(board: chess.Board, position: Any):
@@ -146,12 +152,12 @@ def verify_position(board: chess.Board, position: Any):
             color == "White"
         )
 
-    actual = board.piece_map()
+    actual = dict(board.piece_map())
 
     if supplied != actual:
         raise ValueError(
             "Position does not match OldMoves. "
-            "Send the complete occupied-square map or omit Position."
+            "Send every occupied square or omit Position."
         )
 
 
@@ -167,31 +173,31 @@ def configure_strength(engine, elo: int):
 
         engine.configure({
             "UCI_LimitStrength": True,
-            "UCI_Elo": applied
+            "UCI_Elo": applied,
         })
 
         return {
             "Requested": elo,
             "Applied": applied,
-            "Mode": "UCI_Elo"
+            "Mode": "UCI_Elo",
         }
 
     if "Skill Level" in options:
         engine.configure({
             "UCI_LimitStrength": False,
-            "Skill Level": 0
+            "Skill Level": 0,
         })
 
         return {
             "Requested": elo,
-            "Applied": "minimum skill (approximation)",
-            "Mode": "Skill Level"
+            "Applied": "minimum skill approximation",
+            "Mode": "Skill Level",
         }
 
     return {
         "Requested": elo,
         "Applied": "engine default",
-        "Mode": "default"
+        "Mode": "default",
     }
 
 
@@ -200,10 +206,111 @@ def score_cp(info, pov):
 
     if score.is_mate():
         mate = score.mate()
-
-        return 100000 if mate and mate > 0 else -100000
+        return 100000 if mate is not None and mate > 0 else -100000
 
     return score.score(mate_score=100000)
+
+
+def has_forced_mate(info, pov):
+    if not info:
+        return False
+
+    score = info["score"].pov(pov)
+
+    return score.is_mate() and score.mate() is not None and score.mate() > 0
+
+
+def is_sacrifice(board_after, move, after_info, cpl):
+    """
+    Conservative sacrifice heuristic.
+
+    The opponent's best reply must capture the moved piece, while
+    the engine evaluation must still consider the position sound.
+    """
+
+    if after_info is None or cpl > 30:
+        return False
+
+    pv = after_info.get("pv", [])
+
+    if not pv:
+        return False
+
+    reply = pv[0]
+
+    if not board_after.is_capture(reply):
+        return False
+
+    moved_piece = board_after.piece_at(move.to_square)
+
+    if moved_piece is None:
+        return False
+
+    captured_piece = board_after.piece_at(reply.to_square)
+
+    if board_after.is_en_passant(reply):
+        captured_square = (
+            reply.to_square - 8
+            if board_after.turn == chess.WHITE
+            else reply.to_square + 8
+        )
+        captured_piece = board_after.piece_at(captured_square)
+
+    if captured_piece is None:
+        return False
+
+    sacrificed_value = chess.piece_value(moved_piece.piece_type)
+    captured_value = chess.piece_value(captured_piece.piece_type)
+
+    material_cost = sacrificed_value - captured_value
+
+    # Require a meaningful sacrifice, not an ordinary exchange.
+    if material_cost < 2:
+        return False
+
+    # Do not call a losing blunder a brilliant sacrifice.
+    return True
+
+
+def classify_rating(
+    cpl,
+    is_top_move,
+    forced,
+    missed_win,
+    brilliant,
+    great_find,
+):
+    if missed_win:
+        return "missed_win"
+
+    if brilliant:
+        return "brilliant"
+
+    if forced:
+        return "forced"
+
+    if great_find:
+        return "great_find"
+
+    if is_top_move:
+        return "best"
+
+    if cpl <= 10:
+        return "excellent"
+
+    if cpl <= 30:
+        return "correct"
+
+    if cpl <= 60:
+        return "good"
+
+    if cpl <= 120:
+        return "inaccuracy"
+
+    if cpl <= 250:
+        return "mistake"
+
+    return "blunder"
 
 
 def move_type(board_before, board_after, move):
@@ -231,102 +338,13 @@ def move_type(board_before, board_after, move):
     return "Regular"
 
 
-def is_sacrifice(board_before, board_after, move):
-    piece = board_before.piece_at(move.from_square)
-
-    if piece is None:
-        return False
-
-    if piece.piece_type in (chess.KING, chess.PAWN):
-        return False
-
-    # A rough sacrifice indicator, not a complete tactical proof.
-    return (
-        board_after.piece_at(move.to_square) is None
-        and not board_after.is_checkmate()
-    )
-
-
-def classify_rating(
-    cpl,
-    is_top_move,
-    board_before,
-    board_after,
-    move,
-    after_info,
-    is_book_move=False
-):
-    mover = board_before.turn
-
-    if board_after.is_checkmate():
-        return (
-            "checkmate_white"
-            if mover == chess.WHITE
-            else "checkmate_black"
-        )
-
-    if board_after.is_stalemate():
-        return (
-            "draw_white"
-            if mover == chess.WHITE
-            else "draw_black"
-        )
-
-    if is_book_move:
-        return "book"
-
-    if len(list(board_before.legal_moves)) == 1:
-        return "forced"
-
-    if after_info:
-        score = after_info["score"].pov(mover)
-
-        if score.is_mate() and score.mate() and score.mate() > 0:
-            return "mate"
-
-    # A winning position that has lost its winning advantage.
-    if cpl >= 150:
-        if after_info:
-            before_info_score = None
-
-            # The caller's engine evaluation is used for the normal
-            # move-quality thresholds below.
-            if before_info_score is not None:
-                pass
-
-    if is_top_move and cpl <= 5:
-        if is_sacrifice(board_before, board_after, move):
-            return "brilliant"
-
-        return "great_find"
-
-    if is_top_move:
-        return "best"
-
-    if cpl <= 10:
-        return "excellent"
-
-    if cpl <= 30:
-        return "correct"
-
-    if cpl <= 60:
-        return "good"
-
-    if cpl <= 120:
-        return "inaccuracy"
-
-    if cpl <= 250:
-        return "mistake"
-
-    return "blunder"
-
-
-def illegal_response(reason):
+def event_response(rating, event_type):
     return jsonify({
-        "Legal": False,
-        "Type": "Illegal",
-        "MoveRating": "incorrect",
-        "Reason": reason
+        "Legal": True,
+        "Type": event_type,
+        "MoveRating": rating,
+        "CentipawnLoss": 0,
+        "BotMove": None,
     })
 
 
@@ -335,7 +353,7 @@ def root():
     return jsonify({
         "Service": "Chess API",
         "Status": "online",
-        "Endpoint": "POST /analyze"
+        "Endpoint": "POST /analyze",
     })
 
 
@@ -352,28 +370,35 @@ def analyze():
         return error("Request body must be a JSON object.")
 
     try:
-        board = parse_old_moves(data.get("OldMoves", []))
-        verify_position(board, data.get("Position"))
+        # Game events do not require a chess move.
+        game_event = data.get("GameEvent")
 
-        # Optional resignation event.
-        if data.get("Resign") is True:
-            resigning_color = (
-                "White" if board.turn == chess.WHITE else "Black"
+        if game_event is not None:
+            if game_event == "Winner":
+                return event_response("winner", "Winner")
+
+            if game_event == "Resign":
+                color = data.get("Color")
+
+                if color not in ("White", "Black"):
+                    raise ValueError(
+                        "Color must be White or Black for resignation."
+                    )
+
+                rating = (
+                    "resign_white"
+                    if color == "White"
+                    else "resign_black"
+                )
+
+                return event_response(rating, "Resignation")
+
+            raise ValueError(
+                "GameEvent must be null, Winner, or Resign."
             )
 
-            return jsonify({
-                "Legal": True,
-                "Type": "Resignation",
-                "MoveRating": (
-                    "resign_white"
-                    if board.turn == chess.WHITE
-                    else "resign_black"
-                ),
-                "Winner": (
-                    "Black" if board.turn == chess.WHITE else "White"
-                ),
-                "BotMove": None
-            })
+        board = parse_old_moves(data.get("OldMoves", []))
+        verify_position(board, data.get("Position"))
 
         from_sq = square_name(data.get("From"), "From")
         to_sq = square_name(data.get("To"), "To")
@@ -381,10 +406,10 @@ def analyze():
         moving_piece = board.piece_at(from_sq)
 
         if moving_piece is None:
-            return illegal_response("No piece exists on From.")
+            return illegal("No piece exists on From.")
 
         if moving_piece.color != board.turn:
-            return illegal_response("It is not that piece's turn.")
+            return illegal("It is not that piece's turn.")
 
         expected_piece = piece_type(data.get("Piece"))
         expected_color = data.get("Color")
@@ -396,9 +421,7 @@ def analyze():
             moving_piece.piece_type != expected_piece
             or moving_piece.color != (expected_color == "White")
         ):
-            return illegal_response(
-                "Piece or Color does not match the board."
-            )
+            return illegal("Piece or Color does not match the board.")
 
         promotion = data.get("Promotion")
 
@@ -407,7 +430,7 @@ def analyze():
             "Queen": chess.QUEEN,
             "Rook": chess.ROOK,
             "Bishop": chess.BISHOP,
-            "Knight": chess.KNIGHT
+            "Knight": chess.KNIGHT,
         }
 
         if promotion not in promotion_map:
@@ -418,20 +441,22 @@ def analyze():
         move = chess.Move(
             from_sq,
             to_sq,
-            promotion=promotion_map[promotion]
+            promotion=promotion_map[promotion],
         )
 
         if move not in board.legal_moves:
-            return illegal_response("Move is not legal in this position.")
+            return illegal("Move is not legal in this position.")
 
-        is_castle = bool(data.get("IsCastle", False))
+        is_castle = data.get("IsCastle", False)
+
+        if not isinstance(is_castle, bool):
+            raise ValueError("IsCastle must be a boolean.")
+
         castle_side = data.get("CastleSide")
         actual_castle = board.is_castling(move)
 
         if is_castle != actual_castle:
-            return illegal_response(
-                "IsCastle does not match the actual move."
-            )
+            return illegal("IsCastle does not match the actual move.")
 
         if actual_castle:
             actual_side = (
@@ -441,13 +466,20 @@ def analyze():
             )
 
             if castle_side != actual_side:
-                return illegal_response(
-                    "CastleSide does not match the actual move."
-                )
+                return illegal("CastleSide does not match the actual move.")
+
+        is_book_move = data.get("IsBookMove", False)
+
+        if not isinstance(is_book_move, bool):
+            raise ValueError("IsBookMove must be a boolean.")
 
         elo = data.get("Elo", 1500)
 
-        if isinstance(elo, bool) or not isinstance(elo, int) or not 100 <= elo <= 3500:
+        if (
+            isinstance(elo, bool)
+            or not isinstance(elo, int)
+            or not 100 <= elo <= 3500
+        ):
             raise ValueError("Elo must be an integer between 100 and 3500.")
 
         mover = board.turn
@@ -457,63 +489,117 @@ def analyze():
             engine = get_engine()
             strength = configure_strength(engine, elo)
 
+            legal_moves_before = list(board.legal_moves)
+            forced = len(legal_moves_before) == 1
+
+            # Evaluation of the position before the submitted move.
             best_info = engine.analyse(
                 board,
-                chess.engine.Limit(time=ANALYSIS_TIME)
+                chess.engine.Limit(time=ANALYSIS_TIME),
             )
 
             best_move = best_info.get("pv", [None])[0]
             best_score = score_cp(best_info, mover)
 
+            captured_piece = board.piece_at(to_sq)
+
             board.push(move)
 
-            if (
-                board.is_checkmate()
-                or board.is_stalemate()
+            kind = move_type(board_before, board, move)
+
+            # Terminal positions must be scored from the mover's POV.
+            if board.is_checkmate():
+                played_score = 100000
+                after_info = None
+
+            elif (
+                board.is_stalemate()
                 or board.is_insufficient_material()
                 or board.is_seventyfive_moves()
                 or board.is_fivefold_repetition()
             ):
-                # Correct score perspective: checkmate delivered by
-                # the player is positive from that player's perspective.
-                played_score = (
-                    100000 if board.is_checkmate() else 0
-                )
+                played_score = 0
                 after_info = None
+
             else:
                 after_info = engine.analyse(
                     board,
-                    chess.engine.Limit(time=ANALYSIS_TIME)
+                    chess.engine.Limit(time=ANALYSIS_TIME),
                 )
 
                 played_score = score_cp(after_info, mover)
 
             cpl = max(0, best_score - played_score)
 
-            rating = classify_rating(
-                cpl,
-                move == best_move,
-                board_before,
-                board,
-                move,
-                after_info,
-                bool(data.get("IsBookMove", False))
-            )
+            # End-of-game ratings take priority.
+            if board.is_checkmate():
+                rating = (
+                    "checkmate_white"
+                    if mover == chess.WHITE
+                    else "checkmate_black"
+                )
 
-            kind = move_type(board_before, board, move)
+            elif board.is_game_over():
+                rating = (
+                    "draw_white"
+                    if mover == chess.WHITE
+                    else "draw_black"
+                )
 
+            elif has_forced_mate(after_info, mover):
+                rating = "mate"
+
+            elif is_book_move:
+                rating = "book"
+
+            else:
+                missed_win = (
+                    best_score >= 300
+                    and played_score <= 100
+                    and cpl >= 150
+                )
+
+                brilliant = is_sacrifice(
+                    board,
+                    move,
+                    after_info,
+                    cpl,
+                )
+
+                great_find = (
+                    move == best_move
+                    and cpl <= 20
+                    and captured_piece is not None
+                    and captured_piece.piece_type in (
+                        chess.ROOK,
+                        chess.QUEEN,
+                    )
+                )
+
+                rating = classify_rating(
+                    cpl=cpl,
+                    is_top_move=(move == best_move),
+                    forced=forced,
+                    missed_win=missed_win,
+                    brilliant=brilliant,
+                    great_find=great_find,
+                )
+
+            # The engine's reply.
             if board.is_game_over():
                 bot_move_data = None
+
             else:
                 reply_info = engine.analyse(
                     board,
-                    chess.engine.Limit(time=ANALYSIS_TIME)
+                    chess.engine.Limit(time=ANALYSIS_TIME),
                 )
 
                 reply = reply_info.get("pv", [None])[0]
 
                 if reply is None:
                     bot_move_data = None
+
                 else:
                     bot_piece = board.piece_at(reply.from_square)
 
@@ -524,13 +610,16 @@ def analyze():
                             bot_piece.piece_type
                         ).capitalize(),
                         "Color": (
-                            "White" if bot_piece.color else "Black"
+                            "White"
+                            if bot_piece.color
+                            else "Black"
                         ),
                         "Rating": "best",
                         "Promotion": (
                             chess.piece_name(reply.promotion).capitalize()
-                            if reply.promotion else None
-                        )
+                            if reply.promotion
+                            else None
+                        ),
                     }
 
         return jsonify({
@@ -539,7 +628,7 @@ def analyze():
             "MoveRating": rating,
             "CentipawnLoss": cpl,
             "BotMove": bot_move_data,
-            "EngineStrength": strength
+            "EngineStrength": strength,
         })
 
     except ValueError as exc:
@@ -557,5 +646,5 @@ def analyze():
 if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
-        port=int(os.getenv("PORT", "10000"))
+        port=int(os.getenv("PORT", "10000")),
     )
